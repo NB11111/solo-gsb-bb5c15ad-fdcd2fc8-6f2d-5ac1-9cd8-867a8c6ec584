@@ -540,7 +540,10 @@ def preview_next_batch(body: BatchIn | None = None):
     balances, aging clocks, batches and the ledger are all left untouched
     (errors leave no partial changes). The response carries
     ``"preview": true``; its ``batch_id``/event ids are prospective and are
-    not persisted.
+    not persisted. ``events`` lists the batch's whole valid ledger stream
+    read from the uncommitted transaction (the staged rows), in ledger order
+    and without the ``GET /ledger`` row cap; the tentative trailing grants
+    that never led to a dispatch are rolled back first and never appear.
     """
     return scheduler.preview_batch(
         now=None if body is None else body.reference()
@@ -553,7 +556,14 @@ def get_ledger(
     batch_id: int | None = None,
     limit: int = Query(default=200, ge=1, le=10_000),
 ):
-    """Credit/debit audit trail (AGING / QUANTUM / DISPATCH)."""
+    """Credit/debit audit trail (AGING / QUANTUM / DISPATCH).
+
+    Returns up to ``limit`` rows in ledger (id) order, oldest first; the cap
+    is this endpoint's own pagination limit and is independent of
+    ``/scheduler/batch`` / ``/scheduler/preview``, whose ``events`` field
+    always carries that batch's *entire* valid event stream (even above
+    10000 rows) so dispatch debits are never missing.
+    """
     return scheduler.list_ledger(
         tenant_id=tenant_id, batch_id=batch_id, limit=limit
     )

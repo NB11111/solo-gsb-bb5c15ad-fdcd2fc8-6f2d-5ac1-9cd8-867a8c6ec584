@@ -126,6 +126,16 @@ the same reference instant on the same database state yields the same
 selection order, GPU usage, balances and credit events, and even reuses the
 same prospective batch/ledger row ids.
 
+Both endpoints assemble the batch's ``events`` from the open transaction
+(``ORDER BY id``) with **no row cap**: with a small ``BASE_QUANTUM_GPU_MIN``
+or costly jobs one batch can legitimately emit well over 500 events, and
+clipping the stream would drop the DISPATCH debits a client needs to
+recompute balances. This unlimited assembly is batch-only; ``GET /ledger``
+keeps its own ``limit`` (default 200, max 10000). The trailing QUANTUM grants
+that never led to a dispatch are deleted from the transaction before the
+snapshot is assembled, so they never appear in the stream — in a preview or
+in a committed batch.
+
 Job dependencies
 ================
 ``POST /jobs`` accepts ``depends_on``: a list of job ids (from ANY tenant)
@@ -1944,7 +1954,8 @@ def run_batch(
     """Schedule the next batch of jobs and commit every effect.
 
     Returns the selection order, per-tenant balances after the batch, capacity
-    usage and an explainable ledger of credit/debit events.
+    usage and the batch's whole ledger of credit/debit events in ledger order
+    (no row cap, unlike the paginated ``GET /ledger``).
     """
     return _run_batch_transaction(now=now, settings=settings, persist=True)
 
@@ -2468,7 +2479,15 @@ def _batch_result(
         # Tenant budget figures are evaluated at this batch's reference
         # instant, so they match the very window the decision was made on.
         "tenants": _list_tenants(conn, window_end=now_dt),
-        "events": _list_ledger(conn, batch_id=batch_id),
+        # The whole batch's valid events in ledger order, with no row cap:
+        # a batch that needs many QUANTUM grants before each DISPATCH (low
+        # quantum or high-cost jobs) can emit far more than the GET /ledger
+        # limit, and clipping here would drop the DISPATCH debits needed to
+        # reconcile balances. In a preview these are the staged rows of the
+        # (still-open, soon-to-roll-back) transaction; trailing grants that
+        # never led to a dispatch have already been deleted by
+        # rollback_uncommitted(), so they never appear here either.
+        "events": _list_ledger(conn, batch_id=batch_id, limit=None),
     }
 
 
@@ -2693,8 +2712,12 @@ def _list_ledger(
     conn: sqlite3.Connection,
     tenant_id: str | None = None,
     batch_id: int | None = None,
-    limit: int = 500,
+    limit: int | None = 500,
 ) -> list[dict[str, Any]]:
+    # ``limit=None`` returns every matching row in ledger order; batch/preview
+    # assembly uses it so a batch that writes more than the GET /ledger cap
+    # (low quantum or costly jobs need many QUANTUM grants before a DISPATCH)
+    # still reports every valid event, including the dispatch debits.
     sql = "SELECT * FROM ledger WHERE 1=1"
     params: list[Any] = []
     if tenant_id:
@@ -2703,8 +2726,10 @@ def _list_ledger(
     if batch_id is not None:
         sql += " AND batch_id = ?"
         params.append(batch_id)
-    sql += " ORDER BY id ASC LIMIT ?"
-    params.append(limit)
+    sql += " ORDER BY id ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     return [
         {

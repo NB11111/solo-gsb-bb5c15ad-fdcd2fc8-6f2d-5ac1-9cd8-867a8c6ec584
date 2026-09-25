@@ -130,6 +130,90 @@ def test_preview_matches_batch_multi_round_aging(conn):
     assert_preview_matches_batch(preview, committed)
 
 
+def test_preview_batch_events_not_truncated_over_500(conn, monkeypatch):
+    # A tiny quantum with a costly job needs one QUANTUM grant per round
+    # (plus one AGING grant and the DISPATCH debit): far more than the old
+    # hard-coded 500-row assembly cap that dropped the dispatch debit and
+    # made the response unusable for balance reconciliation.
+    from app.config import get_settings
+
+    monkeypatch.setenv("BASE_QUANTUM_GPU_MIN", "1")
+    get_settings.cache_clear()
+    submit("a", 1, 600, weight=1.0, when=iso(0))
+
+    preview = scheduler.preview_batch(now=at(10))
+    events = preview["events"]
+    assert len(events) > 500
+    # Ledger order (id ascending); the final event is the dispatch debit.
+    assert [e["id"] for e in events] == sorted(e["id"] for e in events)
+    assert events[-1]["kind"] == "DISPATCH"
+    assert events[-1]["job_id"] == "J000001"
+    # The single dispatch debit is present; every event after it is none.
+    dispatches = [e for e in events if e["kind"] == "DISPATCH"]
+    assert [e["job_id"] for e in dispatches] == ["J000001"]
+    # The quantum grants account for the rest of the credit alongside aging.
+    assert any(e["kind"] == "QUANTUM" for e in events)
+    # The stream reconciles to the reported tenant balances exactly.
+    balances = {t["id"]: t["balance_gpu_min"] for t in preview["tenants"]}
+    stream_end = {}
+    for e in events:
+        stream_end[e["tenant_id"]] = e["balance_after"]
+    assert stream_end == balances
+
+    # Same state, same time: the committed batch returns the identical full
+    # stream (including prospective ids reused after rollback).
+    committed = scheduler.run_batch(now=at(10))
+    assert len(committed["events"]) > 500
+    assert committed["events"][-1]["kind"] == "DISPATCH"
+    assert [(e["id"], e["kind"], e["amount"], e["balance_after"], e["job_id"])
+            for e in preview["events"]] == [
+               (e["id"], e["kind"], e["amount"], e["balance_after"], e["job_id"])
+               for e in committed["events"]]
+
+    # GET /ledger keeps its own limit semantics (default 200, capped 10000);
+    # the unlimited assembly is batch-result-only.
+    from app import db as db_mod
+    c = db_mod.get_conn()
+    total = c.execute(
+        "SELECT COUNT(*) AS n FROM ledger WHERE batch_id = ?",
+        (committed["batch_id"],)).fetchone()["n"]
+    assert total == len(committed["events"])
+    assert len(scheduler.list_ledger(batch_id=committed["batch_id"])) == 200
+    assert len(
+        scheduler.list_ledger(batch_id=committed["batch_id"], limit=10000)
+    ) == total
+
+
+def test_preview_excludes_rolled_back_trailing_quanta(conn, monkeypatch):
+    # A fitting-but-never-affordable job accrues tentative QUANTUM grants
+    # until max_rounds stops the loop; those trailing grants are rolled back
+    # and must not appear in the (now uncapped) batch event stream.
+    from app.config import get_settings
+
+    monkeypatch.setenv("BASE_QUANTUM_GPU_MIN", "1")
+    monkeypatch.setenv("MAX_ROUNDS", "3")
+    get_settings.cache_clear()
+    # Cost 600 > 3 rounds x quantum 1: the job fits physically (1 of 8 GPUs)
+    # but never becomes affordable, so every tentative grant is discarded.
+    submit("a", 1, 600, weight=1.0, when=iso(0))
+
+    preview = scheduler.preview_batch(now=at(5))
+    assert preview["selection_order"] == []
+    assert all(e["kind"] != "QUANTUM" for e in preview["events"])
+    assert all(e["kind"] != "DISPATCH" for e in preview["events"])
+    # Aging settlement (5 min waited) is still reported.
+    assert [e["kind"] for e in preview["events"]] == ["AGING"]
+
+    # The committed batch at the same instant runs the identical rollback and
+    # returns the identical (tentative-free) stream; nothing leaked either.
+    committed = scheduler.run_batch(now=at(5))
+    assert [(e["id"], e["kind"], e["amount"]) for e in preview["events"]] == \
+           [(e["id"], e["kind"], e["amount"]) for e in committed["events"]]
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM ledger WHERE kind = 'QUANTUM'"
+    ).fetchone()["n"] == 0
+
+
 def test_preview_writes_nothing(conn):
     submit("a", 2, 10, when=iso(0))
     submit("a", 2, 10, when=iso(1))

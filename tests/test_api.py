@@ -61,6 +61,40 @@ def test_full_lifecycle_via_http(client):
     assert client.get("/health").json() == {"status": "ok"}
 
 
+def test_batch_events_not_truncated_over_500_http(client):
+    # Default quantum 60 GPU-min: a 1-GPU x 30000-min job (cost 30000) needs
+    # 500 QUANTUM grants before the DISPATCH debit -> 501 valid events. The
+    # old assembly cap returned only the first 500, hiding the dispatch.
+    j = client.post("/jobs", json={
+        "tenant_id": "team-a", "gpus": 1, "duration_min": 30000,
+        "weight": 1}).json()["id"]
+    when = {"now": "2026-01-02T00:00:00Z"}  # before arrival -> zero aging
+
+    p = client.post("/scheduler/preview", json=when)
+    assert p.status_code == 200, p.text
+    pe = p.json()["events"]
+    assert len(pe) == 501
+    assert pe[-1]["kind"] == "DISPATCH" and pe[-1]["job_id"] == j
+    assert sum(1 for e in pe if e["kind"] == "QUANTUM") == 500
+    # Preview stays a zero-write dry run.
+    assert client.get("/ledger").json() == []
+
+    b = client.post("/scheduler/batch", json=when)
+    be = b.json()["events"]
+    assert len(be) == 501
+    assert be[-1]["kind"] == "DISPATCH" and be[-1]["job_id"] == j
+    assert [e["id"] for e in be] == [e["id"] for e in pe]
+    # The returned stream reconciles exactly to the reported tenant balance.
+    tenants = {t["id"]: t for t in b.json()["tenants"]}
+    assert be[-1]["balance_after"] == tenants["team-a"]["balance_gpu_min"]
+
+    # GET /ledger still applies its own limit (default 200; max 10000).
+    bid = b.json()["batch_id"]
+    assert len(client.get(f"/ledger?batch_id={bid}").json()) == 200
+    assert len(client.get(f"/ledger?batch_id={bid}&limit=10000").json()) == 501
+    assert client.get("/ledger?limit=10001").status_code == 422
+
+
 def test_validation_errors(client):
     r = client.post("/jobs", json={
         "tenant_id": "x", "gpus": 0, "duration_min": 10})
