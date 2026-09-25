@@ -12,16 +12,23 @@
 ## 一条命令启动
 
 需要本机已安装 Docker 与 Docker Compose 插件（Docker Desktop / `docker-compose-plugin`）。
-镜像构建只需 `requirements.txt`，SQLite 数据库文件（含**租户/作业/批次/账本与 GPU
-维护时段**）保存在命名卷 `scheduler-data`（容器内 `/data/scheduler.db`），重建容器不丢数据：
+镜像构建只需 `requirements.txt`；**首次启动自动建库建表（含旧库补列迁移），无需任何
+手工初始化步骤**。SQLite 数据库文件（含**租户/作业/批次/账本与 GPU 维护时段**）保存在
+命名卷 `scheduler-data`（容器内 `/data/scheduler.db`），重建容器不丢数据。
+
+一条命令构建镜像并后台启动（`--build` 首次或代码更新后会自动重建镜像，`-d` 后台运行）：
 
 ```bash
-docker compose up --build -d        # 构建镜像并后台启动
+docker compose up --build -d        # 一条命令：构建镜像 + 建库初始化 + 后台启动
 docker compose logs -f scheduler    # 跟踪服务日志（Ctrl-C 仅退出查看）
 docker compose ps                   # 查看容器与健康检查状态
 ```
 
-服务监听 **`http://localhost:8000`**（容器内 8000，可在 `docker-compose.yml` 改宿主机端口）。
+服务启动后即监听 **`http://localhost:8000`**（容器内端口固定为 `8000`，宿主机端口默认
+也映射为 `8000`；如需改动，在 `docker-compose.yml` 的 `ports` 里调整冒号左侧的宿主机
+端口即可，例如 `"18000:8000"`，随后 API 基础地址相应改为 `http://localhost:18000`）。
+唯一必需配置是下方「配置」一节的环境变量（`docker-compose.yml` 已给出全部默认值，开箱
+即用，无需额外设置）。
 
 停止 / 清理：
 
@@ -383,7 +390,11 @@ curl -X POST http://localhost:8000/jobs/graph \
 | `BASE_QUANTUM_GPU_MIN` | `60` | 每单位权重每轮的量子（GPU-分钟） |
 | `AGING_RATE_GPU_MIN_PER_MIN` | `1` | 每等待 1 分钟补偿的 GPU-分钟 |
 | `AGING_CAP_GPU_MIN` | 空（无上限） | 单批次老化补偿上限 |
+| `MAX_ROUNDS` | `10000` | 单批次 DRR 轮询的安全上限（通常远早于此结束） |
 | `DB_PATH` | `/data/scheduler.db` | SQLite 文件路径 |
+
+以上变量在 `docker-compose.yml` 中均已给出（与默认一致），**开箱即用、无需额外配置**；
+仅当需要调整集群规模或调度参数时才修改它们。
 
 提交作业时若 `gpus > CLUSTER_GPUS`（永远无法运行）会被拒绝（400）。无
 `Idempotency-Key` 的提交始终按当前容量校验；带 key 时只有**未命中的首次提交**
@@ -626,6 +637,14 @@ curl -X POST http://localhost:8000/scheduler/batch \
 }
 ```
 
+> **`events` 始终返回该批次的完整账本事件流**（按账本 `id` 升序，即事件实际入账顺序）：
+> 批次开始的 `AGING` 老化入账与各轮的 `QUANTUM` 授权、`DISPATCH` 扣款逐条在列。低量子或
+> 高成本作业可能让**单批事件超过 500 条**（DISPATCH 扣款排在大量 QUANTUM 之后），批次
+> 结果因此**不套用** `GET /ledger` 的条数上限——否则会丢掉尾部的 DISPATCH 扣款，仅凭响应
+> 便无法复核余额（把某租户的事件金额从 0 累加即得该租户的批次后余额，每条事件也带
+> `balance_after`）。已回滚的尾轮试探 QUANTUM（从未促成派发）不会混入结果；`GET /ledger`
+> 查询接口仍保留自己的 `limit` 语义（默认 200、最大 10000），不受影响。
+
 ### 2b. 预演下一批（dry-run，零写入）`POST /scheduler/preview`
 
 在**不写入任何数据**的前提下预演一次批次，返回与正式批次相同结构的结果：
@@ -655,6 +674,10 @@ curl -X POST http://localhost:8000/scheduler/preview \
   “若正式执行会是什么样”的预测视图。
 - 预演可**任意重复调用**：同刻重复预演结果一致，无法借预演“刷”量子或老化信用。
 - 空队列预演返回 `selection_order: []`、`events: []`，同样零写入。
+- `events` 是预演事务内**暂存**的完整事件流（包含其中的 AGING/QUANTUM/DISPATCH），
+  随事务回滚而**不落库**；与正式批次一样**不做条数截断**，即便单批超过 500 条也全部
+  返回，且同状态同刻下与正式批次逐条一致（顺序、金额、`balance_after` 与 `id`）。已
+  回滚的尾轮试探 QUANTUM 不会混入。
 
 ```jsonc
 // POST /scheduler/preview 的响应（与正式批次同构，仅多 preview 标记）
@@ -752,6 +775,17 @@ curl http://localhost:8000/tenants/team-a
 curl http://localhost:8000/scheduler/state          # 容量、空闲 GPU、调参、租户余额
 curl "http://localhost:8000/ledger?tenant_id=team-a&limit=200"  # AGING/QUANTUM/DISPATCH 审计
 ```
+
+`GET /ledger` 是**带条数上限**的审计查询（与批次结果不同）：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `tenant_id` | 否 | 只看某租户 |
+| `batch_id` | 否 | 只看某正式批次（预演不入库，故无法用此查询取预演事件——预演事件在其响应的 `events` 中） |
+| `limit` | 否 | 返回**最早**（账本 `id` 升序）的条数，默认 **200**，范围 `1..10000` |
+
+需要一次取齐某个超过该上限的批次时，请直接用该批次 `/scheduler/batch`（或
+`/scheduler/preview`）响应中的 `events`——它返回该批**全部**事件、不截断（见第 2 节）。
 
 `GET /queue` 示例（`J000005` 等待 `J000003` 完成，队列中直接标出阻塞原因）：
 
@@ -950,14 +984,14 @@ curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
 | GET | `/jobs/{id}/maintenance-slots` | **QUEUED 作业维护空档查询**：以当前 RUNNING 占用为固定基线，叠加已保存维护时段，返回 `[start, end)` 内可行的预计开始时刻区间（含两端包含标记与孤立时刻）及最早时刻；非 QUEUED → 409，无空档返回空列表 |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限，可选 `budget_gpu_min` 设置/更新/清除滚动 24h GPU-分钟预算（省略保留、null 清除） |
 | GET | `/tenants` / `/tenants/{id}` | 租户与余额 |
-| POST | `/scheduler/batch` | **调度下一批（落库）**，返回选择顺序与余额；可选请求体 `{"now": <UTC ISO-8601>}` 指定参考时刻 |
-| POST | `/scheduler/preview` | **预演下一批（零写入，事务回滚）**：与 batch 同一套 WDRR/老化/上限/依赖判定，返回预测的派发顺序、批次后 GPU 占用、租户余额与信用事件；可选 `{"now": ...}` |
+| POST | `/scheduler/batch` | **调度下一批（落库）**，返回选择顺序与余额；可选请求体 `{"now": <UTC ISO-8601>}` 指定参考时刻。`events` 返回该批**全部**账本事件（按账本顺序，不截断），含全部 DISPATCH 扣款 |
+| POST | `/scheduler/preview` | **预演下一批（零写入，事务回滚）**：与 batch 同一套 WDRR/老化/上限/依赖判定，返回预测的派发顺序、批次后 GPU 占用、租户余额与信用事件；`events` 含事务内暂存事件且同样不截断，同状态同刻与正式批次逐项一致；可选 `{"now": ...}` |
 | GET | `/scheduler/state` | 集群/调参/租户快照 |
 | GET | `/queue` | 每租户 FIFO 队列与位置 |
 | GET | `/usage/gpu` | **按 UTC 时间窗汇总**每租户/全局 GPU-分钟与重叠作业数（可选 `tenant_id`） |
 | POST | `/maintenance-windows` | 创建**持久化 GPU 维护时段**（UTC 半开区间 + 预留 GPU 数）；结束不晚于开始、单条预留超容量、或候选覆盖期间与已有时段的合计预留峰值超当前容量（写事务内校验，端点相接不累加、等于容量可创建）均返回 400 且不落库 |
 | GET | `/maintenance-windows` | 列出维护时段（可按 `active_at` UTC 时刻过滤活动时段） |
-| GET | `/ledger` | 信用/扣减审计流水 |
+| GET | `/ledger` | 信用/扣减审计流水（按账本 `id` 升序，受 `limit` 限制：默认 **200**、`1..10000`，可按 `tenant_id`/`batch_id` 过滤）；单批完整事件请用 batch/preview 响应中的 `events` |
 | GET | `/health` | 健康检查（本机：<http://localhost:8000/health>） |
 
 ---

@@ -371,3 +371,46 @@ def test_tenant_cap_validation_http(client):
     # New tenant without the field is unlimited (default behaviour).
     r = client.post("/tenants", json={"tenant_id": "y", "weight": 1})
     assert r.status_code == 201 and r.json()["max_gpus"] is None
+
+
+def test_batch_and_preview_events_not_truncated_over_500_http(client):
+    # Eight high-cost jobs (1 GPU x 6000 min = 6000) need 100 quantum rounds
+    # on the 10-min aging grant: one batch emits 8 AGING + 800 QUANTUM +
+    # 8 DISPATCH = 816 events, with every DISPATCH past the old 500-row cap.
+    from app import db as db_mod
+
+    for i, tid in enumerate("abcdefgh", start=1):
+        client.post("/jobs", json={
+            "tenant_id": f"team-{tid}", "gpus": 1, "duration_min": 6000})
+        db_mod.get_conn().execute(
+            "UPDATE jobs SET queued_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00+00:00", f"J{i:06d}"))
+
+    body = {"now": "2026-01-01T00:10:00Z"}
+
+    preview = client.post("/scheduler/preview", json=body)
+    assert preview.status_code == 200, preview.text
+    p = preview.json()
+    assert p["preview"] is True
+    assert len(p["selection_order"]) == 8
+    kinds = [e["kind"] for e in p["events"]]
+    assert len(p["events"]) == 816
+    assert kinds.count("DISPATCH") == 8
+    assert kinds.count("QUANTUM") == 800
+
+    # Staged preview rows did not persist; GET /ledger stays empty.
+    assert client.get("/ledger?limit=10000").json() == []
+
+    # The committed batch at the same instant returns the same full stream.
+    b = client.post("/scheduler/batch", json=body).json()
+    assert b["preview"] is False
+    assert len(b["events"]) == 816
+    assert [(e["id"], e["kind"], e["amount"]) for e in b["events"]] == \
+        [(e["id"], e["kind"], e["amount"]) for e in p["events"]]
+    # Every dispatch debit is present after the commit too.
+    assert sum(1 for e in b["events"] if e["kind"] == "DISPATCH") == 8
+
+    # GET /ledger keeps its limit semantics: 200 default, 10000 ceiling.
+    assert len(client.get("/ledger").json()) == 200
+    assert len(client.get("/ledger?limit=10000").json()) == 816
+    assert client.get("/ledger?limit=10001").status_code == 422

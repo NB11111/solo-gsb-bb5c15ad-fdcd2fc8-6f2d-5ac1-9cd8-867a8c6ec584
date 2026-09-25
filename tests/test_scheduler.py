@@ -777,3 +777,73 @@ def test_max_gpus_column_migrated_from_legacy_database(tmp_path, monkeypatch):
     finally:
         db_mod.reset_for_tests()
         get_settings.cache_clear()
+
+
+def test_batch_result_returns_full_event_stream_over_limit(conn):
+    # High-cost jobs (or, equivalently, a low base quantum) can make one
+    # batch emit well over GET /ledger's 500-row default. The batch/preview
+    # result must nevertheless return the whole ledger-ordered stream so
+    # every DISPATCH debit is present and balances reconcile from the
+    # response.
+    #
+    # Eight tenants each hold a 1-GPU, 6000-min job (cost 6000). They all fit
+    # the 8-GPU cluster and need 100 quantum rounds (60/round) on top of the
+    # 10-min aging grant, so one batch writes 8 AGING + 800 QUANTUM +
+    # 8 DISPATCH = 816 events; every DISPATCH lands past row 500.
+    for tid in "abcdefgh":
+        submit(tid, 1, 6000, weight=1.0, when=iso(0))
+
+    preview = scheduler.preview_batch(now=at(10))
+    assert preview["preview"] is True
+    assert preview["rounds"] == 100
+    assert len(preview["selection_order"]) == 8
+
+    # The preview's staged stream is complete: the cap used to hide every
+    # DISPATCH (they land after the >500 QUANTUM grants).
+    kinds = [e["kind"] for e in preview["events"]]
+    assert kinds.count("AGING") == 8
+    assert kinds.count("QUANTUM") == 800
+    assert kinds.count("DISPATCH") == 8
+    assert len(preview["events"]) == 816
+    # Ledger order: the events are returned id-ascending with no gaps, and
+    # every DISPATCH follows the QUANTUM that made its job affordable.
+    assert [e["id"] for e in preview["events"]] == list(range(1, 817))
+    for i, e in enumerate(preview["events"]):
+        if e["kind"] == "DISPATCH":
+            assert preview["events"][i - 1]["kind"] == "QUANTUM"
+            assert preview["events"][i - 1]["tenant_id"] == e["tenant_id"]
+
+    # Per-tenant balances reconcile purely from the response events:
+    # start at 0, sum the signed amounts, end at the reported balance
+    # (10 aging + 100*60 quantum - 6000 cost = 10).
+    for t in preview["tenants"]:
+        total = sum(e["amount"] for e in preview["events"]
+                    if e["tenant_id"] == t["id"])
+        assert total == pytest.approx(t["balance_gpu_min"]) == pytest.approx(10.0)
+    # ...and each DISPATCH's balance_after is the running total right then.
+    for tid in "abcdefgh":
+        dispatch = next(e for e in preview["events"]
+                        if e["tenant_id"] == tid and e["kind"] == "DISPATCH")
+        running = sum(
+            e["amount"] for e in preview["events"]
+            if e["tenant_id"] == tid and e["id"] <= dispatch["id"]
+        )
+        assert running == pytest.approx(dispatch["balance_after"])
+
+    # A committed batch at the same instant yields the identical stream
+    # (same staged/then-persisted ids), not a truncated prefix of it.
+    committed = scheduler.run_batch(now=at(10))
+    assert committed["preview"] is False
+    assert [(e["id"], e["tenant_id"], e["batch_id"], e["job_id"], e["kind"],
+             e["amount"], e["balance_after"])
+            for e in committed["events"]] == \
+        [(e["id"], e["tenant_id"], e["batch_id"], e["job_id"], e["kind"],
+          e["amount"], e["balance_after"])
+         for e in preview["events"]]
+
+    # GET /ledger keeps its own limit semantics: 200 by default, up to 10000
+    # on request (a batch_id filter still caps), and it never errors.
+    assert len(scheduler.list_ledger(batch_id=committed["batch_id"])) == 200
+    big = scheduler.list_ledger(limit=10_000)
+    assert len(big) == 816
+    assert [e["id"] for e in big] == list(range(1, 817))

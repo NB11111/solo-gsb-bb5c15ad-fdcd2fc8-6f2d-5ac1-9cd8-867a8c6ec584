@@ -126,6 +126,16 @@ the same reference instant on the same database state yields the same
 selection order, GPU usage, balances and credit events, and even reuses the
 same prospective batch/ledger row ids.
 
+Both result snapshots return the batch's *entire* event stream in ledger
+order — for a preview these are the staged rows still inside the transaction
+that is about to roll back. The stream is never capped the way
+``GET /ledger`` is (whose ``limit`` defaults to 200 and tops out at 10000):
+a low base quantum or high-cost jobs can make one batch emit well over 500
+events, and truncating the tail would drop the DISPATCH debits needed to
+reconcile the reported balances. Tentative trailing QUANTUM grants that never
+led to a dispatch are rolled back (``rollback_uncommitted``) before the
+snapshot is built, so they never appear in either result.
+
 Job dependencies
 ================
 ``POST /jobs`` accepts ``depends_on``: a list of job ids (from ANY tenant)
@@ -2468,7 +2478,15 @@ def _batch_result(
         # Tenant budget figures are evaluated at this batch's reference
         # instant, so they match the very window the decision was made on.
         "tenants": _list_tenants(conn, window_end=now_dt),
-        "events": _list_ledger(conn, batch_id=batch_id),
+        # The batch's entire event stream in ledger order — including the
+        # staged entries still inside a preview's (about-to-roll-back)
+        # transaction — never capped: a low quantum / high-cost batch can
+        # produce far more than GET /ledger's 500-row default, and dropping
+        # the tail would lose the DISPATCH debits needed to reconcile these
+        # balances. Trailing tentative QUANTUM grants were already removed by
+        # ``rollback_uncommitted`` before this is called, so they can never
+        # appear here. ``GET /ledger`` keeps its own limit semantics.
+        "events": _list_ledger(conn, batch_id=batch_id, limit=None),
     }
 
 
@@ -2693,8 +2711,18 @@ def _list_ledger(
     conn: sqlite3.Connection,
     tenant_id: str | None = None,
     batch_id: int | None = None,
-    limit: int = 500,
+    limit: int | None = 500,
 ) -> list[dict[str, Any]]:
+    """Ledger rows in ledger (insertion) order.
+
+    ``limit`` caps the number of rows (the ``GET /ledger`` semantics); pass
+    ``limit=None`` for every matching row without a cap. Batch result
+    assembly always uses ``None``: one batch (committed or previewed) can
+    legitimately emit more than 500 events — a low base quantum or high-cost
+    jobs require many accrual rounds before a dispatch — and truncating the
+    stream would drop the trailing DISPATCH debits, so the response could no
+    longer reconcile the balances it reports.
+    """
     sql = "SELECT * FROM ledger WHERE 1=1"
     params: list[Any] = []
     if tenant_id:
@@ -2703,8 +2731,14 @@ def _list_ledger(
     if batch_id is not None:
         sql += " AND batch_id = ?"
         params.append(batch_id)
-    sql += " ORDER BY id ASC LIMIT ?"
-    params.append(limit)
+    # Ledger order is the AUTOINCREMENT id: the start-of-batch AGING grants,
+    # then each round's QUANTUM grants and DISPATCH debits interleaved in the
+    # exact order they were applied. Only cap the row count for the query API;
+    # batch assembly asks for the complete, untruncated stream.
+    sql += " ORDER BY id ASC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
     rows = conn.execute(sql, params).fetchall()
     return [
         {

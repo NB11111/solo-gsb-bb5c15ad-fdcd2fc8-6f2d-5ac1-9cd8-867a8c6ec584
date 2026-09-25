@@ -14,6 +14,8 @@ services:
       AGING_RATE_GPU_MIN_PER_MIN: "1"
       # Optional per-batch aging cap; unset/empty disables the cap.
       AGING_CAP_GPU_MIN: ""
+      # Safety stop for the per-batch DRR round loop.
+      MAX_ROUNDS: "10000"
       DB_PATH: /data/scheduler.db
     volumes:
       - scheduler-data:/data
